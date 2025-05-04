@@ -164,7 +164,11 @@ class RegionClassifier(nn.Module):
             nn.BatchNorm1d(256),
             nn.ReLU(),
             nn.Dropout(0.4),
-            nn.Linear(256, num_classes)
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, num_classes)
         )
         
         self._initialize_weights(self.metadata_encoder)
@@ -253,7 +257,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
             # Scale loss and perform backward pass
             scaler.scale(loss).backward()
             
-            # Apply gradient clipping to prevent exploding gradients
+            # Apply gradient clipping
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
