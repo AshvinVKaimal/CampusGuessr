@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-from torchvision.models import efficientnet_b3, EfficientNet_B3_Weights
+import timm
 from PIL import Image
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -149,21 +149,24 @@ val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_w
 class LatLongRegressor(nn.Module):
     def __init__(self, num_classes=2):
         super(LatLongRegressor, self).__init__()
-        # Pre-trained EfficientNet B3
-        self.efficientnet = efficientnet_b3(weights=EfficientNet_B3_Weights.DEFAULT)
+        # Pre-trained ConvNeXt Large model
+        self.convnext = timm.create_model('convnext_xlarge.fb_in22k_ft_in1k', pretrained=True)
         
-        # Fine-tuning
-        layers = 3
-        ct = 0
-        for child in self.efficientnet.features.children():
-            ct += 1
-            if ct < layers:
-                for param in child.parameters():
-                    param.requires_grad = False
-        num_ftrs = self.efficientnet.classifier[1].in_features
+        # # Fine-tuning
+        # layers = 5
+        # ct = 0
+        # for child in self.convnext.features.children():
+        #     ct += 1
+        #     if ct < layers:
+        #         for param in child.parameters():
+        #             param.requires_grad = False
+        # num_ftrs = self.convnext.classifier[2].in_features
         
-        # Replace the final classifier
-        self.efficientnet.classifier = nn.Identity()
+        # # Remove default classifier
+        # self.convnext.classifier = nn.Identity()
+
+        num_ftrs = self.convnext.num_features
+        self.convnext.reset_classifier(0)  # Remove the classifier layer
         
         # Process metadata
         self.metadata_encoder = nn.Sequential(
@@ -243,7 +246,7 @@ class LatLongRegressor(nn.Module):
         
     def forward(self, x, metadata):
         # Extract features
-        features = self.efficientnet(x)
+        features = self.convnext(x)
         metadata_features = self.metadata_encoder(metadata)
         
         # Concatenate features
@@ -270,7 +273,7 @@ model = LatLongRegressor().to(device)
 mse_loss = nn.MSELoss()
 ce_loss = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
 optimizer = optim.AdamW([
-    {'params': model.efficientnet.parameters(), 'lr': 0.0001},
+    {'params': model.convnext.parameters(), 'lr': 0.0001},
     {'params': model.metadata_encoder.parameters(), 'lr': 0.0005},
     {'params': model.shared_features.parameters(), 'lr': 0.0005},
     {'params': model.coords_regressor.parameters(), 'lr': 0.0005},
