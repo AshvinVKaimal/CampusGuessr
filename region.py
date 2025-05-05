@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-from torchvision.models import efficientnet_b3, EfficientNet_B3_Weights
+import timm
 from PIL import Image
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -42,7 +42,7 @@ print(f"Validation data shape: {val_df.shape}")
 print("\nRegion_ID distribution in training data:")
 print(train_df['Region_ID'].value_counts().sort_index())
 
-# Image transformation for EfficientNet
+# Image transformation for ConvNeXt
 train_transforms = transforms.Compose([
     transforms.Resize((256, 256)),
     transforms.RandomResizedCrop(224),
@@ -126,21 +126,24 @@ val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_w
 class RegionClassifier(nn.Module):
     def __init__(self, num_classes=15):
         super(RegionClassifier, self).__init__()
-        # Pre-trained EfficientNet B3
-        self.efficientnet = efficientnet_b3(weights=EfficientNet_B3_Weights.DEFAULT)
+        # Pre-trained ConvNeXt Large model
+        self.convnext = timm.create_model('convnext_xlarge.fb_in22k_ft_in1k', pretrained=True)
         
-        # Fine-tuning
-        layers = 3
-        ct = 0
-        for child in self.efficientnet.features.children():
-            ct += 1
-            if ct < layers:
-                for param in child.parameters():
-                    param.requires_grad = False
-        num_ftrs = self.efficientnet.classifier[1].in_features
+        # # Fine-tuning
+        # layers = 5
+        # ct = 0
+        # for child in self.convnext.features.children():
+        #     ct += 1
+        #     if ct < layers:
+        #         for param in child.parameters():
+        #             param.requires_grad = False
+        # num_ftrs = self.convnext.classifier[2].in_features
         
-        # Replace the final classifier
-        self.efficientnet.classifier = nn.Identity()
+        # # Remove default classifier
+        # self.convnext.classifier = nn.Identity()
+
+        num_ftrs = self.convnext.num_features
+        self.convnext.reset_classifier(0)  # Remove the classifier layer
         
         # Process metadata
         self.metadata_encoder = nn.Sequential(
@@ -154,8 +157,8 @@ class RegionClassifier(nn.Module):
             nn.Dropout(0.3)
         )
         
-        # Combined regressor
-        self.regressor = nn.Sequential(
+        # Combined classifier
+        self.classifier = nn.Sequential(
             nn.Linear(num_ftrs + 128, 512),
             nn.BatchNorm1d(512),
             nn.ReLU(),
@@ -172,7 +175,7 @@ class RegionClassifier(nn.Module):
         )
         
         self._initialize_weights(self.metadata_encoder)
-        self._initialize_weights(self.regressor)
+        self._initialize_weights(self.classifier)
         
     def _initialize_weights(self, module):
         for m in module.modules():
@@ -186,14 +189,16 @@ class RegionClassifier(nn.Module):
         
     def forward(self, x, metadata):
         # Extract features
-        features = self.efficientnet(x)
+        # features = self.convnext.features(x)
+        # features = features.mean([-2, -1])
+        features = self.convnext(x)
         metadata_features = self.metadata_encoder(metadata)
         
         # Concatenate features
         combined = torch.cat((features, metadata_features), dim=1)
         
-        # Pass through the regressor
-        x = self.regressor(combined)
+        # Pass through the classifier
+        x = self.classifier(combined)
         return x
 
 torch.manual_seed(42)
@@ -210,9 +215,9 @@ class_weights = torch.FloatTensor(class_weights).to(device)
 model = RegionClassifier().to(device)
 criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
 optimizer = optim.AdamW([
-    {'params': model.efficientnet.parameters(), 'lr': 0.0001},
+    {'params': model.convnext.parameters(), 'lr': 0.0001},
     {'params': model.metadata_encoder.parameters(), 'lr': 0.0005},
-    {'params': model.regressor.parameters(), 'lr': 0.0005}
+    {'params': model.classifier.parameters(), 'lr': 0.0005}
 ], weight_decay=1e-4)
 
 def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=20):
@@ -358,6 +363,7 @@ plt.xlabel('Epoch')
 plt.ylabel('Accuracy')
 plt.legend()
 plt.title('Training and Validation Accuracy')
+
 plt.tight_layout()
 plt.savefig(os.path.join(output_dir, 'training_history.png'))
 plt.close()

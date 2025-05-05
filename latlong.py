@@ -39,14 +39,27 @@ print(f"Cleaned train data shape: {train_df.shape}")
 val_df = pd.read_csv(val_labels_path)
 print(f"Validation data shape: {val_df.shape}")
 
-print("\nLatitude range:", train_df['latitude'].min(), "-", train_df['latitude'].max())
-print("Longitude range:", train_df['longitude'].min(), "-", train_df['longitude'].max())
+print("\nRegion_ID distribution in training data:")
+print(train_df['Region_ID'].value_counts().sort_index())
 
-# Global max/min for normalization
-lat_min = min(train_df['latitude'].min(), val_df['latitude'].min())
-lat_max = max(train_df['latitude'].max(), val_df['latitude'].max())
-lon_min = min(train_df['longitude'].min(), val_df['longitude'].min())
-lon_max = max(train_df['longitude'].max(), val_df['longitude'].max())
+region_stats = train_df.groupby('Region_ID')[['latitude', 'longitude']].agg(['mean', 'std', 'min', 'max'])
+print("\nRegion statistics:")
+print(region_stats)
+
+region_boundaries = {}
+for region_id in range(1, 16):
+    if region_id in train_df['Region_ID'].values:
+        region_data = train_df[train_df['Region_ID'] == region_id]
+        region_boundaries[region_id] = {
+            'lat_min': region_data['latitude'].min(),
+            'lat_max': region_data['latitude'].max(),
+            'lat_mean': region_data['latitude'].mean(),
+            'lat_std': region_data['latitude'].std(),
+            'lon_min': region_data['longitude'].min(),
+            'lon_max': region_data['longitude'].max(),
+            'lon_mean': region_data['longitude'].mean(),
+            'lon_std': region_data['longitude'].std()
+        }
 
 # Image transformation for EfficientNet
 train_transforms = transforms.Compose([
@@ -67,14 +80,15 @@ val_transforms = transforms.Compose([
 ])
 
 class LatLongDataset(Dataset):
-    def __init__(self, df, img_dir, lat_min, lat_max, lon_min, lon_max, transform=None):
+    def __init__(self, df, img_dir, transform=None):
         self.df = df
         self.img_dir = img_dir
         self.transform = transform
         
-        self.lat_min, self.lat_max = lat_min, lat_max
-        self.lon_min, self.lon_max = lon_min, lon_max
-        self.angle_min, self.angle_max = 0, 360
+        # Pre-compute min-max values for normalization
+        self.lat_min, self.lat_max = df['latitude'].min(), df['latitude'].max()
+        self.lon_min, self.lon_max = df['longitude'].min(), df['longitude'].max()
+        self.angle_min, self.angle_max = 0, 360  # Angle is between 0 and 360 degrees
         
     def __len__(self):
         return len(self.df)
@@ -86,16 +100,18 @@ class LatLongDataset(Dataset):
         
         if self.transform:
             image = self.transform(image)
-        
+
         # Labels: Latitude and longitude
         latitude = self.df.iloc[idx]['latitude']
         longitude = self.df.iloc[idx]['longitude']
-        
-        # Normalize coordinates to [0, 1]
+        label = torch.tensor([latitude, longitude], dtype=torch.float32)
+
+        # Normalize latitude and longitude
         latitude = (latitude - self.lat_min) / (self.lat_max - self.lat_min)
         longitude = (longitude - self.lon_min) / (self.lon_max - self.lon_min)
+        coords = torch.tensor([latitude, longitude], dtype=torch.float32)
 
-        label = torch.tensor([latitude, longitude], dtype=torch.float32)
+        region_id = self.df.iloc[idx]['Region_ID'] - 1  # Convert to zero-based index
         
         timestamp = self.df.iloc[idx]['timestamp']
         parts = timestamp.strip().split(':')
@@ -115,31 +131,24 @@ class LatLongDataset(Dataset):
         angle = self.df.iloc[idx]['angle']
         angle_sin = np.sin(2 * np.pi * angle / 360)
         angle_cos = np.cos(2 * np.pi * angle / 360)
-
-        # One-hot encoding for Region_ID
-        region_id = self.df.iloc[idx]['Region_ID']
         
         metadata = torch.tensor([
             time_sin, time_cos,
-            angle_sin, angle_cos,
-            region_id
+            angle_sin, angle_cos
         ], dtype=torch.float32)
-
-        # Original coordinates for evaluation
-        coords = torch.tensor([latitude, longitude], dtype=torch.float32)
         
-        return image, metadata, label, coords
+        return image, metadata, coords, region_id, label
 
-train_dataset = LatLongDataset(train_df, train_images_dir, lat_min, lat_max, lon_min, lon_max, transform=train_transforms)
-val_dataset = LatLongDataset(val_df, val_images_dir, lat_min, lat_max, lon_min, lon_max, transform=val_transforms)
+train_dataset = LatLongDataset(train_df, train_images_dir, transform=train_transforms)
+val_dataset = LatLongDataset(val_df, val_images_dir, transform=val_transforms)
 
 batch_size = 16
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
 val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
-class LatLongClassifier(nn.Module):
+class LatLongRegressor(nn.Module):
     def __init__(self, num_classes=2):
-        super(LatLongClassifier, self).__init__()
+        super(LatLongRegressor, self).__init__()
         # Pre-trained EfficientNet B3
         self.efficientnet = efficientnet_b3(weights=EfficientNet_B3_Weights.DEFAULT)
         
@@ -158,7 +167,7 @@ class LatLongClassifier(nn.Module):
         
         # Process metadata
         self.metadata_encoder = nn.Sequential(
-            nn.Linear(19, 64),  # 19 features: sin/cos time + sin/cos angle + 15 regions
+            nn.Linear(4, 64),  # 4 features: sin/cos time, sin/cos angle
             nn.BatchNorm1d(64),
             nn.ReLU(),
             nn.Dropout(0.3),
@@ -168,8 +177,8 @@ class LatLongClassifier(nn.Module):
             nn.Dropout(0.3)
         )
         
-        # Combined regressor
-        self.regressor = nn.Sequential(
+        # Shared features
+        self.shared_features = nn.Sequential(
             nn.Linear(num_ftrs + 128, 512),
             nn.BatchNorm1d(512),
             nn.ReLU(),
@@ -177,16 +186,50 @@ class LatLongClassifier(nn.Module):
             nn.Linear(512, 256),
             nn.BatchNorm1d(256),
             nn.ReLU(),
-            nn.Dropout(0.4),
+            nn.Dropout(0.3)
+        )
+
+        # Coordinate regressor head
+        self.coords_regressor = nn.Sequential(
             nn.Linear(256, 128),
             nn.BatchNorm1d(128),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(128, num_classes)
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, num_classes)
         )
+
+        # Region classifier head
+        self.region_classifier = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 15)  # 15 regions
+        )
+
+        # Combined regressor
+        # self.regressor = nn.Sequential(
+        #     nn.Linear(num_ftrs + 128, 512),
+        #     nn.BatchNorm1d(512),
+        #     nn.ReLU(),
+        #     nn.Dropout(0.4),
+        #     nn.Linear(512, 256),
+        #     nn.BatchNorm1d(256),
+        #     nn.ReLU(),
+        #     nn.Dropout(0.4),
+        #     nn.Linear(256, 128),
+        #     nn.BatchNorm1d(128),
+        #     nn.ReLU(),
+        #     nn.Dropout(0.3),
+        #     nn.Linear(128, num_classes)
+        # )
         
         self._initialize_weights(self.metadata_encoder)
-        self._initialize_weights(self.regressor)
+        self._initialize_weights(self.shared_features)
+        self._initialize_weights(self.coords_regressor)
+        self._initialize_weights(self.region_classifier)
         
     def _initialize_weights(self, module):
         for m in module.modules():
@@ -207,48 +250,61 @@ class LatLongClassifier(nn.Module):
         combined = torch.cat((features, metadata_features), dim=1)
         
         # Pass through the regressor
-        x = self.regressor(combined)
-        return x
+        x = self.shared_features(combined)
+        coords = self.coords_regressor(x)
+        region = self.region_classifier(x)
+        return coords, region
     
-class LinearMSELoss(nn.Module):
-    def __init__(self):
-        super(LinearMSELoss, self).__init__()
-        self.mse = nn.MSELoss()
-        
-    def forward(self, pred, target):
-        loss = self.mse(pred, target)
-        return loss
-
 torch.manual_seed(42)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 np.random.seed(42)
 
-model = LatLongClassifier().to(device)
-criterion = LinearMSELoss()
+class_counts = train_df['Region_ID'].value_counts().sort_index().values
+class_weights = 1.0 / (class_counts / class_counts.sum())
+class_weights = np.sqrt(class_weights)  # Square root smoothing
+class_weights = class_weights / class_weights.sum() * len(class_weights)  # Normalize
+class_weights = torch.FloatTensor(class_weights).to(device)
+
+model = LatLongRegressor().to(device)
+mse_loss = nn.MSELoss()
+ce_loss = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
 optimizer = optim.AdamW([
     {'params': model.efficientnet.parameters(), 'lr': 0.0001},
     {'params': model.metadata_encoder.parameters(), 'lr': 0.0005},
-    {'params': model.regressor.parameters(), 'lr': 0.0005}
+    {'params': model.shared_features.parameters(), 'lr': 0.0005},
+    {'params': model.coords_regressor.parameters(), 'lr': 0.0005},
+    {'params': model.region_classifier.parameters(), 'lr': 0.0005}
 ], weight_decay=1e-4)
 
-def denormalize_coords(coords, lat_min, lat_max, lon_min, lon_max):
-    lat = coords[:, 0] * (lat_max - lat_min) + lat_min
-    lon = coords[:, 1] * (lon_max - lon_min) + lon_min
-    return torch.stack((lat, lon), dim=1)
+def denormalize_coords(coords, stats):
+    if len(coords.shape) == 1:
+        coords = coords.unsqueeze(0)  # Add batch dimension if missing
+    if coords.shape[1] != 2:
+        raise ValueError(f"Expected coords to have shape [batch_size, 2], got {coords.shape}")
+    
+    lat = coords[:, 0] * (stats.lat_max - stats.lat_min) + stats.lat_min
+    lon = coords[:, 1] * (stats.lon_max - stats.lon_min) + stats.lon_min
 
-def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=20):
+    return torch.stack([lat, lon], dim=1)
+
+def train_model(model, train_loader, val_loader, optimizer, num_epochs=20):
     best_val_mse = float('inf')
     best_model_weights = None
-    history = {'train_loss': [], 'val_loss': [], 'train_mse': [], 'val_mse': []}
+    history = {
+        'train_coord_loss': [], 'train_region_loss': [], 'train_total_loss': [],
+        'val_coord_loss': [], 'val_region_loss': [], 'val_total_loss': [],
+        'val_mse': []
+    }
     patience = 10
     no_improve = 0
+    aux_start, aux_end = 0.3, 0.1
     total_steps = int(len(train_loader) * num_epochs * 1.1)
     
     # One Cycle learning rate scheduler
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer, 
-        max_lr=[0.0001, 0.0005, 0.0005], 
+        max_lr=[0.0001, 0.0005, 0.0005, 0.0005, 0.0005], 
         total_steps=total_steps, 
         pct_start=0.3,
         div_factor=25, 
@@ -261,23 +317,27 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
     for epoch in range(num_epochs):
         # Training
         model.train()
-        running_loss = 0.0
-        all_train_true = []
-        all_train_pred = []
-        
+        running_coord_loss = 0.0
+        running_region_loss = 0.0
+        running_total_loss = 0.0
+        aux_wt = aux_start + (aux_end - aux_start) * (epoch / num_epochs)
+
         train_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]")
-        for images, metadata, targets, coords in train_bar:
+        for images, metadata, coords, regions, _ in train_bar:
             images = images.to(device)
             metadata = metadata.to(device)
-            targets = targets.to(device)
+            coords = coords.to(device)
+            regions = regions.to(device)
             
             optimizer.zero_grad()
             with torch.amp.autocast("cuda"):
-                outputs = model(images, metadata)
-                loss = criterion(outputs, targets)
+                pred_coords, pred_regions = model(images, metadata)
+                coord_loss = mse_loss(pred_coords, coords)
+                region_loss = ce_loss(pred_regions, regions)
+                total_loss = coord_loss + region_loss * aux_wt
             
             # Scale loss and perform backward pass
-            scaler.scale(loss).backward()
+            scaler.scale(total_loss).backward()
             
             # Apply gradient clipping
             scaler.unscale_(optimizer)
@@ -291,62 +351,83 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
             scheduler.step()
             
             # Statistics
-            pred_coords = denormalize_coords(outputs.detach().cpu(), lat_min, lat_max, lon_min, lon_max)
-            all_train_true.extend(pred_coords)
-            all_train_pred.extend(coords)
-            running_loss += loss.item() * images.size(0)
+            running_coord_loss += coord_loss.item() * images.size(0)
+            running_region_loss += region_loss.item() * images.size(0)
+            running_total_loss += total_loss.item() * images.size(0)
             
             # Update progress bar
-            train_bar.set_postfix({'loss': loss.item()})
+            train_bar.set_postfix({
+                'coord_loss': coord_loss.item(),
+                'region_loss': region_loss.item(),
+                'total_loss': total_loss.item()
+            })
         
-        epoch_train_loss = running_loss / len(train_loader.dataset)
-        all_train_true = torch.cat(all_train_true)
-        all_train_pred = torch.cat(all_train_pred)
-        epoch_train_mse = mean_squared_error(all_train_true.numpy(), all_train_pred.numpy())
-
-        history['train_loss'].append(epoch_train_loss)
-        history['train_mse'].append(epoch_train_mse)
+        epoch_train_coord_loss = running_coord_loss / len(train_loader.dataset)
+        epoch_train_region_loss = running_region_loss / len(train_loader.dataset)
+        epoch_train_total_loss = running_total_loss / len(train_loader.dataset)
+        history['train_coord_loss'].append(epoch_train_coord_loss)
+        history['train_region_loss'].append(epoch_train_region_loss)
+        history['train_total_loss'].append(epoch_train_total_loss)
         
         # Validation
         model.eval()
-        running_loss = 0.0
+        running_coord_loss = 0.0
+        running_region_loss = 0.0
+        running_total_loss = 0.0
         all_val_true = []
         all_val_pred = []
         
         val_bar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]")
         with torch.no_grad():
-            for images, metadata, targets, coords in val_bar:
+            for images, metadata, coords, regions, labels in val_bar:
                 images = images.to(device)
                 metadata = metadata.to(device)
-                targets = targets.to(device)
+                coords = coords.to(device)
+                regions = regions.to(device)
                 
                 # Forward pass
-                outputs = model(images, metadata)
-                loss = criterion(outputs, targets)
+                pred_coords, pred_regions = model(images, metadata)
+                coord_loss = mse_loss(pred_coords, coords)
+                region_loss = ce_loss(pred_regions, regions)
+                total_loss = coord_loss + region_loss * aux_wt
                 
                 # Statistics
-                pred_coords = denormalize_coords(outputs.detach().cpu(), lat_min, lat_max, lon_min, lon_max)
-                all_val_true.extend(pred_coords)
-                all_val_pred.extend(coords)
-                running_loss += loss.item() * images.size(0)
+                running_coord_loss += coord_loss.item() * images.size(0)
+                running_region_loss += region_loss.item() * images.size(0)
+                running_total_loss += total_loss.item() * images.size(0)
+
+                # Denormalize coordinates
+                pred_coords = denormalize_coords(pred_coords, val_dataset)
+
+                if epoch == 0 and len(all_val_true) == 0:
+                    print(f"Debug - true_coords shape: {len(all_val_true)}")
+                    print(f"Debug - pred_coords shape: {pred_coords.shape}")
                 
+                all_val_true.extend(labels.cpu().numpy())
+                all_val_pred.extend(pred_coords.cpu().numpy())
+
                 # Update progress bar
-                val_bar.set_postfix({'loss': loss.item()})
+                val_bar.set_postfix({'loss': total_loss.item()})
         
-        epoch_val_loss = running_loss / len(train_loader.dataset)
-        all_val_true = torch.cat(all_val_true)
-        all_val_pred = torch.cat(all_val_pred)
-        epoch_val_mse = mean_squared_error(all_val_true.numpy(), all_val_pred.numpy())
+        epoch_val_coord_loss = running_coord_loss / len(val_loader.dataset)
+        epoch_val_region_loss = running_region_loss / len(val_loader.dataset)
+        epoch_val_total_loss = running_total_loss / len(val_loader.dataset)
+        epoch_val_mse = mean_squared_error(np.array(all_val_true), np.array(all_val_pred))
+        history['val_coord_loss'].append(epoch_val_coord_loss)
+        history['val_region_loss'].append(epoch_val_region_loss)
+        history['val_total_loss'].append(epoch_val_total_loss)
+        history['val_mse'].append(epoch_val_mse)
         
         print(f"Epoch {epoch+1}/{num_epochs}")
-        print(f"Train Loss: {epoch_train_loss:.4f}, Train MSE: {epoch_train_mse:.4f}")
-        print(f"Val Loss: {epoch_val_loss:.4f}, Val MSE: {epoch_val_mse:.4f}")
+        print(f"Train Coordinate Loss: {epoch_train_coord_loss:.6f}, Train Region Loss: {epoch_train_region_loss:.6f}, Train Total Loss: {epoch_train_total_loss:.6f}")
+        print(f"Validation Coordinate Loss: {epoch_val_coord_loss:.6f}, Validation Region Loss: {epoch_val_region_loss:.6f}, Validation Total Loss: {epoch_val_total_loss:.6f}")
+        print(f"Validation MSE: {epoch_val_mse:.6f}")
         
         # Save the best model
         if epoch_val_mse < best_val_mse:
             best_val_mse = epoch_val_mse
             best_model_weights = model.state_dict().copy()
-            print(f"New best model with MSE: {best_val_mse:.4f}")
+            print(f"New best model with MSE: {best_val_mse:.6f}")
             no_improve = 0
         else:
             no_improve += 1
@@ -356,72 +437,144 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
             print(f"Early stopping at epoch {epoch+1} as validation MSE hasn't improved for {patience} epochs")
             break
     
-    print(f"Best validation MSE: {best_val_mse:.4f}")
+    print(f"Best validation MSE: {best_val_mse:.6f}")
     model.load_state_dict(best_model_weights)
     return model, history
 
 # Train the model and save the best weights
 num_epochs = 100
-model, history = train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs)
+model, history = train_model(model, train_loader, val_loader, optimizer, num_epochs)
 torch.save(model.state_dict(), os.path.join(output_dir, 'best_model.pth'))
 
 # Plot training history
-plt.figure(figsize=(12, 5))
-plt.subplot(1, 2, 1)
-plt.plot(history['train_loss'], label='Train Loss')
-plt.plot(history['val_loss'], label='Validation Loss')
+plt.figure(figsize=(18, 10))
+
+plt.subplot(2, 2, 1)
+plt.plot(history['train_coord_loss'], label='Train Coordinate Loss')
+plt.plot(history['val_coord_loss'], label='Validation Coordinate Loss')
 plt.xlabel('Epoch')
 plt.ylabel('Loss')
 plt.legend()
-plt.title('Training and Validation Loss')
+plt.title('Coordinate Loss')
 
-plt.subplot(1, 2, 2)
-plt.plot(history['train_mse'], label='Train MSE')
+plt.subplot(2, 2, 2)
+plt.plot(history['train_region_loss'], label='Train Region Loss')
+plt.plot(history['val_region_loss'], label='Validation Region Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+plt.title('Region Classification Loss')
+
+plt.subplot(2, 2, 3)
+plt.plot(history['train_total_loss'], label='Train Total Loss')
+plt.plot(history['val_total_loss'], label='Validation Total Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+plt.title('Total Loss')
+
+plt.subplot(2, 2, 4)
 plt.plot(history['val_mse'], label='Validation MSE')
 plt.xlabel('Epoch')
-plt.ylabel('Mean Squared Error')
+plt.ylabel('MSE')
 plt.legend()
-plt.title('Training and Validation MSE')
+plt.title('Validation MSE (Denormalized Coordinates)')
+
 plt.tight_layout()
 plt.savefig(os.path.join(output_dir, 'training_history.png'))
 plt.close()
 
-def predict_latlong():
+def predict_coords():
     # For validation set
     model.eval()
-    val_predictions = []
+    val_pred = []
+    val_true = []
     
     with torch.no_grad():
         val_bar = tqdm(val_loader, desc="Predicting validation set")
-        for images, metadata, _ in val_bar:
+        for images, metadata, _, _, coords in val_bar:
             images = images.to(device)
             metadata = metadata.to(device)
             
             # Original image
-            outputs = model(images, metadata)
+            pred_coords, _ = model(images, metadata)
             
             # Horizontal flip
             flipped_images = torch.flip(images, dims=[3])
-            outputs_flip = model(flipped_images, metadata)
-            outputs = (outputs + outputs_flip) / 2
+            pred_coords_flip, _ = model(flipped_images, metadata)
             
-            # Denormalize predictions
-            preds = denormalize_coords(outputs.cpu(), lat_min, lat_max, lon_min, lon_max)
+            # Average predictions from both augmentations
+            final_coords = (pred_coords + pred_coords_flip) / 2
+            if len(val_pred) == 0:
+                print(f"Debug - pred_coords shape: {pred_coords.shape}")
+                print(f"Debug - pred_coords_flip shape: {pred_coords_flip.shape}")
+                print(f"Debug - final_coords shape: {final_coords.shape}")
+
+            final_coords = denormalize_coords(final_coords, val_dataset)
+            if len(val_pred) == 0:
+                print(f"Debug - final_coords shape: {final_coords.shape}")
+                print(f"Debug - coords shape: {coords.shape}")
+                print(f"Debug - pred: {final_coords[0]}, true: {coords[0]}")
             
-            for lat, lon in preds:
-                val_predictions.append((lat.item(), lon.item()))
+            val_pred.extend((final_coords.cpu().numpy()).tolist())
+            val_true.extend(coords.cpu().numpy().tolist())
+
+    val_mse = mean_squared_error(np.array(val_true), np.array(val_pred))
+    print(f"Validation MSE (Denormalized Coordinates): {val_mse:.6f}")
     
     result_df = pd.DataFrame({
         'id': range(738),  # 0 to 737
-        'latitude': [0] * 738,  # Initialize with zeros
-        'longitude': [0] * 738  # Initialize with zeros
+        'latitude': [0.0] * 738,  # Initialize with zeros
+        'longitude': [0.0] * 738  # Initialize with zeros
     })
-    for i, (lat, lon) in enumerate(val_predictions):
-        result_df.loc[i, 'latitude'] = lat
-        result_df.loc[i, 'longitude'] = lon
+    for i, coords in enumerate(val_pred):
+        result_df.at[i, 'latitude'] = coords[0]
+        result_df.at[i, 'longitude'] = coords[1]
     
     # Save results to CSV
     result_df.to_csv(os.path.join(output_dir, output_name), index=False)
     print(f"Results saved to {os.path.join(output_dir, output_name)}")
 
-predict_latlong()
+    # Scatter plot of true vs predicted coordinates
+    plt.figure(figsize=(10, 10))
+    plt.scatter([coord[1] for coord in val_true], [coord[0] for coord in val_true], 
+                alpha=0.5, label='True Coordinates', color='blue')
+    plt.scatter([coord[1] for coord in val_pred], [coord[0] for coord in val_pred], 
+                alpha=0.5, label='Predicted Coordinates', color='red')
+    plt.xlabel('Longitude')
+    plt.ylabel('Latitude')
+    plt.title('True vs Predicted Coordinates')
+    plt.legend()
+    plt.savefig(os.path.join(output_dir, 'coordinates_scatter.png'))
+    plt.close()
+    
+    # Analyze prediction error by Region_ID
+    val_region_ids = val_df['Region_ID'].values
+    region_errors = {}
+    
+    for i, (true_coord, pred_coord) in enumerate(zip(val_true, val_pred)):
+        region_id = val_region_ids[i]
+        error = np.sqrt((true_coord[0] - pred_coord[0])**2 + (true_coord[1] - pred_coord[1])**2)
+        
+        if region_id not in region_errors:
+            region_errors[region_id] = []
+        
+        region_errors[region_id].append(error)
+    
+    # Calculate mean error by region
+    region_mean_errors = {region: np.mean(errors) for region, errors in region_errors.items()}
+    
+    # Plot mean error by region
+    plt.figure(figsize=(12, 6))
+    regions = list(region_mean_errors.keys())
+    errors = list(region_mean_errors.values())
+    
+    plt.bar(regions, errors)
+    plt.xlabel('Region ID')
+    plt.ylabel('Mean Coordinate Error')
+    plt.title('Mean Prediction Error by Region')
+    plt.xticks(regions)
+    plt.savefig(os.path.join(output_dir, 'region_errors.png'))
+    plt.close()
+
+predict_coords()

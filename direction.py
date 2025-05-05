@@ -125,9 +125,9 @@ batch_size = 16
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
 val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
-class AngleClassifier(nn.Module):
+class AngleRegressor(nn.Module):
     def __init__(self, num_classes=2):
-        super(AngleClassifier, self).__init__()
+        super(AngleRegressor, self).__init__()
         # Pre-trained EfficientNet B3
         self.efficientnet = efficientnet_b3(weights=EfficientNet_B3_Weights.DEFAULT)
         
@@ -146,7 +146,7 @@ class AngleClassifier(nn.Module):
         
         # Process metadata
         self.metadata_encoder = nn.Sequential(
-            nn.Linear(5, 64),  # 5 features: sin/cos time, lat, lon, region_id
+            nn.Linear(5, 64),  # 5 features: sin/cos time, lat, lon, Region_ID
             nn.BatchNorm1d(64),
             nn.ReLU(),
             nn.Dropout(0.3),
@@ -227,7 +227,7 @@ torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 np.random.seed(42)
 
-model = AngleClassifier().to(device)
+model = AngleRegressor().to(device)
 criterion = CircularMSELoss()
 optimizer = optim.AdamW([
     {'params': model.efficientnet.parameters(), 'lr': 0.0001},
@@ -378,6 +378,7 @@ plt.xlabel('Epoch')
 plt.ylabel('Mean Absolute Error (degrees)')
 plt.legend()
 plt.title('Training and Validation MAE')
+
 plt.tight_layout()
 plt.savefig(os.path.join(output_dir, 'training_history.png'))
 plt.close()
