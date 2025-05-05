@@ -25,7 +25,7 @@ train_images_dir = 'data/images_train'
 val_images_dir = 'data/images_val'
 train_labels_path = 'data/labels_train.csv'
 val_labels_path = 'data/labels_val.csv'
-output_dir = 'output/region'
+output_dir = 'output/latlong'
 output_name = '2022101015_2.csv'
 os.makedirs(output_dir, exist_ok=True)
 
